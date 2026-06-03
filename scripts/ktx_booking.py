@@ -558,7 +558,21 @@ class PatchedKorail(Korail):
             "txtTrnNo": raw_train.get("h_trn_no", ""),
         }
 
-    def reserve(self, train, passengers=None, option=ReserveOption.GENERAL_FIRST, try_waiting=False):
+    def reserve(
+        self,
+        train,
+        passengers=None,
+        option=ReserveOption.GENERAL_FIRST,
+        try_waiting=False,
+        raw_train: dict[str, object] | None = None,
+        selected_car_no: str | None = None,
+        selected_seat_no: str | None = None,
+    ):
+        if (selected_car_no is None) != (selected_seat_no is None):
+            raise ValueError("selected_car_no and selected_seat_no must be provided together")
+        if selected_car_no is not None and try_waiting:
+            raise ValueError("selected seat reservation does not support waiting-list booking")
+
         reserving_seat = True
         try:
             if not train.has_seat():
@@ -607,7 +621,6 @@ class PatchedKorail(Korail):
             "hidFreeFlg": "N",
             "txtStndFlg": "N",
             "txtMenuId": "11",
-            "txtSrcarCnt": "0",
             "txtJrnyCnt": "1",
             "txtJrnySqno1": "001",
             "txtJrnyTpCd1": "11",
@@ -639,7 +652,24 @@ class PatchedKorail(Korail):
         for index, passenger in enumerate(passengers, start=1):
             payload.update(passenger.get_dict(index))
 
-        response = self._session.get(korail_mod.KORAIL_TICKETRESERVATION, params=payload, headers=headers)
+        if selected_car_no is not None and selected_seat_no is not None:
+            payload.update({
+                "txtSrcarCnt": "1",
+                "txtSrcarNo1": selected_car_no,
+                "txtSeatNo1": selected_seat_no,
+                "txtChgFlg1": "N",
+            })
+            if raw_train:
+                payload.update({
+                    "txtArvStnConsOrdr1": raw_train.get("h_arv_stn_cons_ordr", ""),
+                    "txtArvStnRunOrdr1": raw_train.get("h_arv_stn_run_ordr", ""),
+                    "txtDptStnConsOrdr1": raw_train.get("h_dpt_stn_cons_ordr", ""),
+                    "txtDptStnRunOrdr1": raw_train.get("h_dpt_stn_run_ordr", ""),
+                })
+            response = self._session.post(korail_mod.KORAIL_TICKETRESERVATION, data=payload, headers=headers)
+        else:
+            payload["txtSrcarCnt"] = "0"
+            response = self._session.get(korail_mod.KORAIL_TICKETRESERVATION, params=payload, headers=headers)
         data = json.loads(response.text)
         if self._result_check(data):
             reservation_id = data["h_pnr_no"]
@@ -1001,6 +1031,112 @@ def command_seats(args: argparse.Namespace) -> None:
     })
 
 
+def format_selected_car_no(car_no: int) -> str:
+    if car_no < 1:
+        raise SystemExit("--car-no는 1 이상의 호차 번호여야 합니다")
+    return f"{car_no:04d}"
+
+
+def selected_seat_requested(args: argparse.Namespace) -> bool:
+    return args.select_best_seat or args.car_no is not None or args.seat_no is not None
+
+
+def raw_seats_from_detail(raw: object, car_no: int) -> list[dict[str, object]]:
+    seat_infos = raw.get("seat_infos") if isinstance(raw, dict) else None
+    seat_detail_unavailable = (
+        f"seat detail data is unavailable for car_no {car_no}; retry search or choose another train"
+    )
+    if not isinstance(seat_infos, dict) or "seat_info" not in seat_infos:
+        raise SystemExit(seat_detail_unavailable)
+    raw_seats = seat_infos["seat_info"]
+    if isinstance(raw_seats, dict):
+        raw_seats = [raw_seats]
+    if not isinstance(raw_seats, list) or any(not isinstance(seat, dict) for seat in raw_seats):
+        raise SystemExit(seat_detail_unavailable)
+    try:
+        for raw_seat in raw_seats:
+            validate_raw_seat(raw_seat)
+    except ValueError as exc:
+        raise SystemExit(seat_detail_unavailable) from exc
+    return raw_seats
+
+
+def select_reserve_seat(
+    client: PatchedKorail,
+    raw_train: dict[str, object],
+    passenger_count: int,
+    room_class: str,
+    car_no: int | None,
+    seat_label: str | None,
+    select_best: bool,
+) -> dict[str, object]:
+    if passenger_count != 1:
+        raise SystemExit("지정좌석 예약은 현재 1명 예약만 지원합니다")
+    if select_best and seat_label:
+        raise SystemExit("--select-best-seat와 --seat-no는 같이 사용할 수 없습니다")
+    if not select_best and (car_no is None or not seat_label):
+        raise SystemExit("지정좌석 예약에는 --car-no와 --seat-no를 함께 지정해야 합니다")
+
+    seat_car_unavailable = "seat car data is unavailable; retry search or choose another train"
+    try:
+        cars = [normalize_car(car) for car in client.train_cars(raw_train, passenger_count, room_class)]
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise SystemExit(seat_car_unavailable) from exc
+    if not cars:
+        raise SystemExit(seat_car_unavailable)
+    if car_no is not None:
+        cars = [car for car in cars if car["car_no"] == car_no]
+        if not cars:
+            raise SystemExit(f"{car_no}호차는 선택한 객실 등급에서 조회되지 않습니다")
+    else:
+        cars = sort_cars_for_booking(cars)
+
+    for car in cars:
+        current_car_no = int(car["car_no"])
+        selected_car_no = format_selected_car_no(current_car_no)
+        raw = client.car_seats(raw_train, selected_car_no, passenger_count, room_class)
+        raw_seats = [
+            seat
+            for seat in raw_seats_from_detail(raw, current_car_no)
+            if seat.get("h_con_seat_no") != "0A"
+        ]
+        if select_best:
+            available_raw_seats = [
+                seat for seat in raw_seats
+                if seat.get("h_sale_psb_flg") == "Y" and seat.get("h_seat_no")
+            ]
+            if not available_raw_seats:
+                continue
+            selected_raw_seat = sorted(
+                available_raw_seats,
+                key=lambda seat: seat_preference_key(normalize_seat(seat)),
+            )[0]
+        else:
+            selected_raw_seat = next(
+                (seat for seat in raw_seats if seat.get("h_con_seat_no") == seat_label),
+                None,
+            )
+            if selected_raw_seat is None:
+                raise SystemExit(f"{current_car_no}호차 {seat_label} 좌석을 찾을 수 없습니다")
+            if selected_raw_seat.get("h_sale_psb_flg") != "Y":
+                raise SystemExit(f"{current_car_no}호차 {seat_label} 좌석은 예약 가능 상태가 아닙니다")
+            if not selected_raw_seat.get("h_seat_no"):
+                raise SystemExit(f"{current_car_no}호차 {seat_label} 좌석의 내부번호를 확인할 수 없습니다")
+
+        selected_seat = normalize_seat(selected_raw_seat)
+        return {
+            "car_no": current_car_no,
+            "car_no_raw": selected_car_no,
+            "seat": selected_seat["seat"],
+            "seat_no": selected_seat["seat_no"],
+            "direction": selected_seat["direction"],
+            "position": selected_seat["position"],
+            "power_outlet": selected_seat["power_outlet"],
+        }
+
+    raise SystemExit("우선순위 조건에 맞는 예약 가능 좌석을 찾을 수 없습니다")
+
+
 def ensure_ncard_available() -> None:
     if not _NCARD_AVAILABLE:
         raise SystemExit(
@@ -1029,6 +1165,13 @@ def resolve_ncard_no(client: PatchedKorail, ncard_index: int | None, ncard_no: s
 
 def command_reserve(args: argparse.Namespace) -> None:
     client = build_client()
+    wants_selected_seat = selected_seat_requested(args)
+    if wants_selected_seat:
+        if args.try_waiting or args.include_waiting_list:
+            raise SystemExit("지정좌석 예약은 예약대기 옵션과 같이 사용할 수 없습니다")
+        if getattr(args, "ncard_index", None) is not None or getattr(args, "ncard_no", None):
+            raise SystemExit("지정좌석 예약은 현재 N카드 예약과 같이 사용할 수 없습니다")
+
     ncard_no = resolve_ncard_no(
         client,
         getattr(args, "ncard_index", None),
@@ -1038,27 +1181,62 @@ def command_reserve(args: argparse.Namespace) -> None:
         passengers = [NCardPassenger(card_no=ncard_no)]
     else:
         passengers = parse_passengers(args)
-    include_waiting_list = args.include_waiting_list or args.try_waiting
-    trains = client.search_train(
-        args.dep,
-        args.arr,
-        args.date,
-        args.time,
-        train_type=TRAIN_TYPE_MAP[args.train_type],
-        passengers=passengers,
-        include_no_seats=args.include_no_seats,
-        include_waiting_list=include_waiting_list,
-    )
-    selected_train = find_train_by_id(trains, args.train_id)
-    if selected_train is None:
-        raise SystemExit(TRAIN_ID_STALE_MESSAGE)
+    selected_seat = None
+    raw_train = None
+    if wants_selected_seat:
+        passenger_count = sum(passenger.count for passenger in Passenger.reduce(passengers))
+        details = client.search_train_details(
+            args.dep,
+            args.arr,
+            args.date,
+            args.time,
+            train_type=TRAIN_TYPE_MAP[args.train_type],
+            passengers=passengers,
+            include_no_seats=args.include_no_seats,
+            include_waiting_list=False,
+        )
+        match = find_train_detail_by_id(details, args.train_id)
+        if match is None:
+            raise SystemExit(TRAIN_ID_STALE_MESSAGE)
+        selected_train, raw_train = match
+        selected_seat = select_reserve_seat(
+            client,
+            raw_train,
+            passenger_count,
+            ROOM_CLASS_MAP[args.room],
+            args.car_no,
+            args.seat_no,
+            args.select_best_seat,
+        )
+    else:
+        include_waiting_list = args.include_waiting_list or args.try_waiting
+        trains = client.search_train(
+            args.dep,
+            args.arr,
+            args.date,
+            args.time,
+            train_type=TRAIN_TYPE_MAP[args.train_type],
+            passengers=passengers,
+            include_no_seats=args.include_no_seats,
+            include_waiting_list=include_waiting_list,
+        )
+        selected_train = find_train_by_id(trains, args.train_id)
+        if selected_train is None:
+            raise SystemExit(TRAIN_ID_STALE_MESSAGE)
+
     reservation = client.reserve(
         selected_train,
         passengers=passengers,
         option=RESERVE_OPTION_MAP[args.seat_option],
         try_waiting=args.try_waiting,
+        raw_train=raw_train,
+        selected_car_no=None if selected_seat is None else str(selected_seat["car_no_raw"]),
+        selected_seat_no=None if selected_seat is None else str(selected_seat["seat_no"]),
     )
-    print_json({"reservation": normalize_reservation(reservation)})
+    payload = {"reservation": normalize_reservation(reservation)}
+    if selected_seat is not None:
+        payload["selected_seat"] = selected_seat
+    print_json(payload)
 
 
 def command_reservations(_: argparse.Namespace) -> None:
@@ -1201,6 +1379,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(TRAIN_TYPE_MAP),
         default="ktx",
         help="재조회할 열차 종류 — search 단계에서 사용한 값과 동일하게 지정 (기본 ktx)",
+    )
+    reserve_parser.add_argument(
+        "--room",
+        choices=sorted(ROOM_CLASS_MAP),
+        default="general",
+        help="지정좌석 예약에 사용할 객실 등급 (기본 general)",
+    )
+    reserve_parser.add_argument("--car-no", type=int, default=None, help="지정 예약할 호차 번호")
+    reserve_parser.add_argument("--seat-no", default=None, help="지정 예약할 좌석 번호. 예: 1A")
+    reserve_parser.add_argument(
+        "--select-best-seat",
+        action="store_true",
+        help="좌석 우선순위 알고리즘으로 최상위 좌석을 지정 예약",
     )
     reserve_parser.add_argument("--include-no-seats", action="store_true", help="검색 시 매진 열차도 포함")
     reserve_parser.add_argument("--include-waiting-list", action="store_true", help="검색 시 예약대기 열차도 포함")
